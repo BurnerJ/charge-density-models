@@ -52,6 +52,7 @@ def write_CHGCAR_like(
     model,
     input_CHGCAR_path,
     output_CHGCAR_path,
+    task_id,
     batch_size = 100000,
     use_tqdm = False,
     device = 'cuda',
@@ -60,6 +61,7 @@ def write_CHGCAR_like(
     vcd.chg[0] = inference(
         atoms = vcd.atoms[0],
         model = model,
+        task_id=task_id,
         grid = vcd.chg[0].shape,
         atom_cutoff = model.atom_message_model.cutoff,
         probe_cutoff = model.probe_message_model.cutoff,

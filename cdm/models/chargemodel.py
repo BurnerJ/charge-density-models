@@ -18,6 +18,15 @@ from ocpmodels.common.utils import load_state_dict
 
 from cdm.utils.probe_graph import ProbeGraphAdder
 
+class customTanh(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input):
+        ex = torch.exp(input)
+        ex_1 = torch.exp(-input)
+        return ((ex - ex_1)) / ((2*ex) + ex_1)
+
 
 @registry.register_model('charge_model')
 class ChargeModel(torch.nn.Module):
@@ -105,17 +114,75 @@ class ChargeModel(torch.nn.Module):
             probe_final_mlp = False
         
         if probe_final_mlp:
-            self.probe_output_function = torch.nn.Sequential(
+           self.probe_output_function_0 = torch.nn.Sequential(
+                
                 torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
                 torch.nn.ELU(),
-                torch.nn.Linear(self.probe_message_model.hidden_channels, 1)
+                torch.nn.Dropout(0.2),
+                
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+                
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+                
+                torch.nn.Linear(self.probe_message_model.hidden_channels, 1),
+                torch.nn.Softplus()
             )
-            
+ 
+           self.probe_output_function_1 = torch.nn.Sequential(
+                
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+                
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+                
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+                
+                torch.nn.Linear(self.probe_message_model.hidden_channels, 1),
+                torch.nn.Softplus()
+            )
+
+           self.probe_output_function_2 = torch.nn.Sequential(
+
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+
+                torch.nn.Linear(self.probe_message_model.hidden_channels, self.probe_message_model.hidden_channels),
+                #torch.nn.BatchNorm1d(self.probe_message_model.hidden_channels),
+                torch.nn.ELU(),
+                torch.nn.Dropout(0.2),
+
+                torch.nn.Linear(self.probe_message_model.hidden_channels, 1),
+                torch.nn.Softplus()
+            )
+
+
         self.otf_pga = ProbeGraphAdder(**otf_pga_config)
         
         
     @conditional_grad(torch.enable_grad())
-    def forward(self, data):
+    def forward(self, data, task_id):
         # Ensure data has probe points
         data = self.otf_pga(data)
         data.probe_data = [pyg2_data_transform(data.probe_data)]
@@ -123,7 +190,7 @@ class ChargeModel(torch.nn.Module):
         
         atom_representations = self.forward_atomic(data)
 
-        probes = self.forward_probe(data.probe_data, atom_representations)
+        probes = self.forward_probe(data.probe_data, atom_representations, task_id)
         
         return probes
     
@@ -141,14 +208,19 @@ class ChargeModel(torch.nn.Module):
         return(atom_representations)
             
     @conditional_grad(torch.enable_grad())        
-    def forward_probe(self, data, atom_representations):
+    def forward_probe(self, data, atom_representations, task_id):
         data.atom_representations = atom_representations[-self.probe_message_model.num_interactions:]
         
         probe_results = self.probe_message_model(data)
         
-        if hasattr(self, 'probe_output_function'):
-            probe_results = self.probe_output_function(probe_results).flatten()
-            
+        if hasattr(self, 'probe_output_function_0') or hasattr(self, 'probe_output_function_1') or hasattr(self, 'probe_output_function_2'):
+            if task_id == 0:
+                probe_results = self.probe_output_function_0(probe_results).flatten()
+            elif task_id == 1:
+                probe_results = self.probe_output_function_1(probe_results).flatten()
+            elif task_id == 2:
+                probe_results = self.probe_output_function_2(probe_results).flatten()
+
         probe_results = torch.nan_to_num(probe_results)
         
         if self.enforce_zero_for_disconnected_probes:

@@ -79,7 +79,7 @@ class VaspChargeDensity(VaspChargeDensity):
         chg = np.fromfile(fobj, count = np.prod(shape), sep=' ')
 
         chg = chg.reshape(shape, order = 'F')
-        chg /= volume
+        #chg /= volume
 
         return chg
         

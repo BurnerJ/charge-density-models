@@ -127,12 +127,12 @@ class ProbeGraphAdder():
                     np.prod(grid_pos.shape[-5:-2]),
                     size = num_probes,
                 )
-                
+
                 probe_choice = np.unravel_index(
                     probe_choice,
                     grid_pos.shape[-5:-2],
                 )
-            
+
                 out = get_edges_from_choice(
                     probe_choice,
                     grid_pos,
@@ -144,13 +144,379 @@ class ProbeGraphAdder():
                 )
 
                 probe_edges, probe_offsets, probe_pos = out
-            
+
             atomic_numbers = torch.clone(data_object.atomic_numbers.detach())
             atomic_numbers = torch.cat((atomic_numbers, torch.zeros(num_probes, device = atomic_numbers.device)))
             
             probe_data.target = (density.reshape(density.shape[-3:])[probe_choice[0:3]]).to(atomic_numbers.device)
             probe_data.total_target = torch.sum(density) * torch.numel(probe_data.target) / torch.numel(density)
+
+        elif mode == "random_and_maxima":
+            density, grid_pos = self.handle_density_array(
+                data_object.charge_density,
+                data_object.cell,
+            )
+
+            probe_edges = torch.tensor([[]])
+
+            while probe_edges.shape[1] < self.assert_min_edges:
+                probe_choice = np.random.randint(
+                    np.prod(grid_pos.shape[-5:-2]),
+                    size = num_probes // 2,
+                )
+                # This is the position of each voxel
+                #print(grid_pos)
+                # This is the number of total voxels
+                #print(np.prod(grid_pos.shape[-5:-2]))
+                # This is the choice of voxels for the probes
+                #print(probe_choice)
+                # We need the set of voxels with the highest target values
+                # In this case, x is the fastest changing index, z is the slowest
+                #print(density.reshape(density.shape[-3:]))
+                #selection = np.argsort(density.reshape(density.shape[-3:]), axis=None)[-1000:]
+                #selection = np.unravel_index(selection, grid_pos.shape[-5:-2])
+                #print(density.reshape(density.shape[-3:])[selection[0:3]])
+                #print(np.argmax(density.reshape(density.shape[-3:])))
+
+                probe_choice = np.unravel_index(
+                    probe_choice,
+                    grid_pos.shape[-5:-2],
+                )
+
+                #print(probe_choice)
+
+                out = get_edges_from_choice(
+                    probe_choice,
+                    grid_pos,
+                    atom_pos = data_object.pos,
+                    cell = data_object.cell,
+                    cutoff = self.cutoff,
+                    include_atomic_edges = self.include_atomic_edges,
+                    implementation = self.implementation,
+                )
+
+                probe_edges, probe_offsets, probe_pos = out
+        
+            # By default, choose the top X occupied points (X = num_probes / 2)
+            #maximum_args = np.argsort(density.reshape(density.shape[-3:]),
+            #                          axis=None)[-num_probes // 2:]
             
+            # Take a sample from each nonzero "chunk" of data
+            try:
+                tmp_num_probes = num_probes - 1250
+                #print(density.reshape(density.shape[-3:]), grid_pos)
+                #exit()
+                other_args = np.argsort(density.reshape(density.shape[-3:]),axis=None)[-np.count_nonzero(density.flatten()):][::np.count_nonzero(density.flatten()) // (tmp_num_probes // 2)]
+                #print(density.reshape(density.shape[-3:])[np.unravel_index(other_args, grid_pos.shape[-5:-2])[0:3]])
+                # Take the remainder of samples as the maximum points
+                maximum_args = np.argsort(density.reshape(density.shape[-3:]),axis=None)[-(tmp_num_probes - len(other_args)):]
+                #print(density.reshape(density.shape[-3:])[np.unravel_index(maximum_args, grid_pos.shape[-5:-2])[0:3]])
+                all_args = np.concatenate((other_args,maximum_args))
+                min_args = np.argsort(density.reshape(density.shape[-3:]), axis=None)[:1000]
+                #print(density.reshape(density.shape[-3:])[np.unravel_index(min_args, grid_pos.shape[-5:-2])[0:3]])
+                all_args = np.concatenate((min_args, all_args))
+                random_args = np.random.randint(low=0, high=density.flatten().shape, size=1250)
+                #print(density.reshape(density.shape[-3:])[np.unravel_index(random_args, grid_pos.shape[-5:-2])[0:3]])
+                #exit()
+                all_args = np.concatenate((random_args, all_args))
+                probe_choice = np.unravel_index(all_args, grid_pos.shape[-5:-2])
+            except ValueError:
+                maximum_args = np.argsort(density.reshape(density.shape[-3:]),
+                                          axis=None)[-num_probes // 2:]
+                maximum_probe_choice = np.unravel_index(maximum_args, grid_pos.shape[-5:-2])
+                probe_choice = np.concatenate((probe_choice, maximum_probe_choice), axis=1)
+            
+            #print(len(all_args))
+            #exit()
+
+            out = get_edges_from_choice(
+                        probe_choice,
+                        grid_pos,
+                        atom_pos = data_object.pos,
+                        cell = data_object.cell,
+                        cutoff = self.cutoff,
+                        include_atomic_edges = self.include_atomic_edges,
+                        implementation = self.implementation)
+
+            probe_edges, probe_offsets, probe_pos = out
+
+            atomic_numbers = torch.clone(data_object.atomic_numbers.detach())
+            atomic_numbers = torch.cat((atomic_numbers, torch.zeros(num_probes, device = atomic_numbers.device)))
+
+            probe_data.target = (density.reshape(density.shape[-3:])[probe_choice[0:3]]).to(atomic_numbers.device)
+            probe_data.total_target = torch.sum(density) * torch.numel(probe_data.target) / torch.numel(density)
+
+        elif mode == "maxregion_and_random":
+
+            def calculate_maxima(data):
+                """
+                Calculate the maxima for the site.
+                """
+
+                from scipy.ndimage import (gaussian_filter,
+                                        maximum_filter,
+                                        generate_binary_structure,
+                                        iterate_structure,
+                                        binary_erosion)
+                data = data.clone()
+                data = data.detach().cpu().numpy()
+                temp_data = data
+                normalising_sum = np.sum(data)
+
+                sigma = (0.4 / 0.15) ** 0.5
+                temp_data = gaussian_filter(temp_data, sigma, mode="wrap")
+                temp_data *= normalising_sum / np.sum(temp_data)
+
+                neighborhood = generate_binary_structure(np.ndim(temp_data), 2)
+                footprint = int(round(0.45 / 0.15, 0))
+                neighborhood = iterate_structure(neighborhood, footprint)
+
+                local_max = (
+                    maximum_filter(temp_data, footprint=neighborhood, mode="wrap") == temp_data
+                )
+
+                background = temp_data == 0
+                eroded_background = binary_erosion(
+                    background, structure=neighborhood, border_value=1
+                )
+                detected_peaks = local_max & ~eroded_background
+
+                # args
+                peaks = np.where(detected_peaks)
+                return peaks
+
+            def create_13x13x13_region(point):
+                x, y, z = point
+                
+                # Create a meshgrid for the offsets
+                offsets = np.arange(-10, 10)
+                xx, yy, zz = np.meshgrid(offsets, offsets, offsets, indexing='ij')
+                
+                # Combine the original point with the offsets
+                region = np.column_stack((x + xx.ravel(), y + yy.ravel(), z + zz.ravel()))
+                
+                return region
+
+            num_densities = len(data_object.charge_density)
+            densities = []
+            
+            for density in data_object.charge_density:
+                dens, grid_pos = self.handle_density_array(
+                    density,
+                    data_object.cell,
+                )
+                densities.append(dens)
+
+            probe_edges = torch.tensor([[]])
+
+            target_choice = np.random.randint(0, num_densities)
+            print(target_choice)
+            density = densities[target_choice]
+            maxima_tuples = calculate_maxima(density)
+            
+            # Assuming density is a 4D NumPy array, and maxima_tuples is a tuple of three arrays
+            shape = density.shape
+            density_flat = density.flatten()
+
+            # Vectorize the initial `flattened_args` construction
+            maxima_points = np.array(maxima_tuples).T
+            indices = maxima_points[:, 0] * (shape[1] * shape[2]) + maxima_points[:, 1] * shape[2] + maxima_points[:, 2]
+            flattened_args = [indices]
+
+            # Vectorize the neighborhood calculation
+            regions = []
+            for point in maxima_points:
+                region = create_13x13x13_region(point)
+                region = np.array(region)
+                region[:, 0] = np.mod(region[:, 0], shape[0])
+                region[:, 1] = np.mod(region[:, 1], shape[1])
+                region[:, 2] = np.mod(region[:, 2], shape[2])
+                region_indices = region[:, 0] * (shape[1] * shape[2]) + region[:, 1] * shape[2] + region[:, 2]
+                regions.append(region_indices)
+
+            # Flatten regions and combine with the initial indices
+            flattened_args = np.concatenate([indices] + regions)
+
+            # Convert flattened_args to NumPy array and filter bad indices
+            flattened_args = np.array(flattened_args)
+            bad_args = np.where((flattened_args >= len(density_flat)) | (flattened_args < 0))[0]
+
+            flattened_args = np.delete(flattened_args, bad_args)
+
+            random_sample = 0.10
+            separate_mode = False
+
+            # In this mode, select a ratio of random probes, and insert probes at the atomic positions
+            if not separate_mode:
+                num_probes_tmp = num_probes - data_object.pos.shape[0]
+                # Determine the number of probes for random and max sampling
+                num_random_probes = int(num_probes_tmp * random_sample)
+                num_max_probes = num_probes_tmp - num_random_probes
+
+                # Random sampling from `flattened_args`
+                random_indices = np.random.randint(0, len(flattened_args), size=num_max_probes)
+                random_args = np.array(flattened_args)[random_indices]
+
+                # Random sampling from the flattened density array
+                density_random_indices = np.random.randint(0, torch.numel(density), size=num_random_probes)
+
+                # Combine both sampled indices
+                all_args = np.concatenate([random_args, density_random_indices])
+
+                # Compute pairwise distances using broadcasting
+                diff = data_object.pos[:, np.newaxis, :] - grid_pos.reshape(-1, 3)[np.newaxis, :, :]  # Shape: (len(array1), len(array2), 3)
+                distances = np.linalg.norm(diff, axis=2)  # Compute Euclidean distance along the last axis
+
+                # Find the index of the closest point in array2 for each point in array1
+                atomic_indices = np.argmin(distances, axis=1)
+
+                all_args = np.concatenate([all_args, atomic_indices])
+
+                np.random.shuffle(all_args)
+
+            # Vectorize the random choice and sampling
+            if separate_mode:
+                choice = np.random.randint(0, 10)  # Randomly choose an integer between 0 and 9
+
+                if choice != 0:
+                    # Select random indices from `flattened_args` without looping
+                    all_args = np.random.choice(flattened_args, size=num_probes, replace=True)
+                else:
+                    # Select random indices from the entire flattened density array
+                    all_args = np.random.randint(0, torch.numel(density), size=num_probes)
+
+                # Shuffle the final selection
+                np.random.shuffle(all_args)
+                
+            # Convert to NumPy array (if not already)
+            all_args = np.array(all_args)
+            probe_choice = np.unravel_index(all_args, grid_pos.shape[-5:-2])
+            out = get_edges_from_choice(
+                        probe_choice,
+                        grid_pos,
+                        atom_pos = data_object.pos,
+                        cell = data_object.cell,
+                        cutoff = self.cutoff,
+                        include_atomic_edges = self.include_atomic_edges,
+                        implementation = self.implementation)
+
+            probe_edges, probe_offsets, probe_pos = out
+
+            atomic_numbers = torch.clone(data_object.atomic_numbers.detach())
+            atomic_numbers = torch.cat((atomic_numbers, torch.zeros(num_probes, device = atomic_numbers.device)))
+
+            targets = []
+            total_targets = []
+
+            for density in densities:
+                target = (density.reshape(density.shape[-3:])[probe_choice[0:3]]).to(atomic_numbers.device)
+                target /= target.sum()
+                total_target = torch.sum(density) * torch.numel(target) / torch.numel(density)
+                targets.append(target)
+                total_targets.append(total_target)
+            
+            probe_data.target = targets
+            probe_data.total_target = total_targets
+
+            #probe_data.total_target = torch.sum(density) * torch.numel(probe_data.target) / torch.numel(density)
+            
+            #for x in probe_data.target:
+                #print(x)
+                #print(np.sort(density.flatten()))
+                #np.save("test.npy", probe_data.target.detach().cpu().numpy())
+                #exit()
+
+
+
+        elif mode == "max_and_min":
+
+            density, grid_pos = self.handle_density_array(
+                data_object.charge_density,
+                data_object.cell,
+            )
+
+            probe_edges = torch.tensor([[]])
+
+
+            try:
+                num_samples = 75
+                oversampling = ((num_probes // 2) // num_samples)
+                # Sample the negative args uniformly from x bins. Then oversample to be roughly 50% of the targets. Ignore the first 25, as we will sample the first 25 maxima with neg_args_2.
+                #neg_args = np.argsort(density.reshape(density.shape[-3:]),axis=None)[25:(density.flatten() < 0).sum():(density.flatten() < 0).sum() // (num_samples // 2)]
+                #neg_args_2 = np.argsort(density.reshape(density.shape[-3:]), axis=None)[:25]
+                #neg_args = np.concatenate((neg_args, neg_args_2))
+                #neg_args = np.repeat(neg_args, oversampling)
+                # Sample the positive args uniformly from x bins. Then oversample to be roughly 25% of the targets.
+                pos_args = np.argsort(density.reshape(density.shape[-3:]),axis=None)[(density.flatten() <= 0).sum()+25::(density.flatten() > 0).sum() // (num_samples // 2)]
+                pos_args_2 = np.argsort(density.reshape(density.shape[-3:]), axis=None)[(density.flatten() <= 0).sum():][-25:]
+                pos_args = np.concatenate((pos_args, pos_args_2))
+                pos_args = np.repeat(pos_args, oversampling)
+                # Sample the rest on a grid
+                remainder_args = np.round(np.linspace(0, len(density.flatten()) - 1, num_probes - len(pos_args))).astype(int)
+            
+                all_args = np.concatenate((remainder_args, pos_args))
+                
+                probe_choice = np.unravel_index(all_args, grid_pos.shape[-5:-2])
+                out = get_edges_from_choice(
+                            probe_choice,
+                            grid_pos,
+                            atom_pos = data_object.pos,
+                            cell = data_object.cell,
+                            cutoff = self.cutoff,
+                            include_atomic_edges = self.include_atomic_edges,
+                            implementation = self.implementation)
+
+                probe_edges, probe_offsets, probe_pos = out
+
+                atomic_numbers = torch.clone(data_object.atomic_numbers.detach())
+                atomic_numbers = torch.cat((atomic_numbers, torch.zeros(num_probes, device = atomic_numbers.device)))
+
+                probe_data.target = (density.reshape(density.shape[-3:])[probe_choice[0:3]]).to(atomic_numbers.device)
+                probe_data.total_target = torch.sum(density) * torch.numel(probe_data.target) / torch.numel(density)
+
+                #for target in probe_data.target:
+                #    print(target.cpu().numpy())
+                #exit()
+
+                #for x in probe_data.target:
+                #    print(x)
+                #print(len(pos_args), len(remainder_args))
+                #print(np.sort(density.flatten()))
+                #np.save("test.npy", probe_data.target.detach().cpu().numpy())
+                #exit()
+
+            # If we get a ValueError, just randomly sample
+            except ValueError:
+                while probe_edges.shape[1] < self.assert_min_edges:
+                    probe_choice = np.random.randint(
+                        np.prod(grid_pos.shape[-5:-2]),
+                        size = num_probes,
+                    )
+
+                    probe_choice = np.unravel_index(
+                        probe_choice,
+                        grid_pos.shape[-5:-2],
+                    )
+
+                    out = get_edges_from_choice(
+                        probe_choice,
+                        grid_pos,
+                        atom_pos = data_object.pos,
+                        cell = data_object.cell,
+                        cutoff = self.cutoff,
+                        include_atomic_edges = self.include_atomic_edges,
+                        implementation = self.implementation,
+                    )
+
+                    probe_edges, probe_offsets, probe_pos = out
+
+                atomic_numbers = torch.clone(data_object.atomic_numbers.detach())
+                atomic_numbers = torch.cat((atomic_numbers, torch.zeros(num_probes, device = atomic_numbers.device)))
+
+                probe_data.target = (density.reshape(density.shape[-3:])[probe_choice[0:3]]).to(atomic_numbers.device)
+                probe_data.total_target = torch.sum(density) * torch.numel(probe_data.target) / torch.numel(density)
+
+
         elif mode == 'specify':
             density, grid_pos = self.handle_density_array(
                 data_object.charge_density, 
@@ -496,7 +862,10 @@ class RadiusGraphPBCWrapper:
         mask_within_radius = torch.le(atom_distance_sqr, radius * radius)
         
         # Remove pairs with the same atoms (distance = 0.0)
-        mask_not_same = torch.gt(atom_distance_sqr, 0.0001)
+        # JB: This causes issues. Probe-atom edges should exist even if it overlaps...
+        #mask_not_same = torch.gt(atom_distance_sqr, 0.0001)
+        # Made this modification...
+        mask_not_same = torch.greater_equal(atom_distance_sqr, 0)
         mask = torch.logical_and(mask_within_radius, mask_not_same)
         index1 = torch.masked_select(index1, mask)
         index2 = torch.masked_select(index2, mask)

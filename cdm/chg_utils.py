@@ -31,46 +31,62 @@ def build_charge_lmdb(inpath, outpath, use_tqdm = False, loud=False, probe_graph
     
     db = lmdb.open(
         os.path.join(outpath, 'charge.lmdb'),
-        map_size=1099511627776 * 2,
+        map_size=1099511627776 * 3,
         subdir=False,
         meminit=False,
         map_async=True,
     )
 
-    
-    paths = os.listdir(inpath)
     if use_tqdm:
-        paths = tqdm(paths)
+        paths_0 = tqdm(os.listdir(inpath[0]))
         
-    for fid, directory in enumerate(paths):
-        if loud:
-            print(directory)
-        
-        try: 
-            vcd = VaspChargeDensity(os.path.join(inpath, directory, 'CHGCAR'))
-            atoms = vcd.atoms[-1]
-            dens = vcd.chg[-1]
-
-            if stride != 1:
-                dens = dens[::stride, ::stride, ::stride]
-
-            data_object = a2g.convert(atoms)
-            data_object.charge_density = dens
-
-            if probe_graph_adder is not None:
-                data_object = probe_graph_adder(object)
-
-            txn = db.begin(write = True)
-            txn.put(f"{fid}".encode("ascii"), pickle.dumps(data_object,protocol=-1))
-            txn.commit()
-        except:
-            print('Exception occured for:', directory)
     
+    for fid, directory in enumerate(paths_0):
+        #if loud:
+        print(directory)
+      
+        txn = db.begin(write = True)
+
+        key = f"{fid}".encode("ascii")  # Convert key to bytes
+
+        # Check if the key already exists
+        if txn.get(key) is not None:
+            print(f"Skipping {directory}, entry already exists.")
+            txn.commit()
+            continue  # Skip if entry exists
+
+        # Make sure all CHGCAR files exist
+        if not all(os.path.exists(os.path.join(path, directory, 'CHGCAR')) for path in inpath):
+            print("All plots not found for MOF: {}".format(directory))
+            continue
+
+        densities = []
+        for path in inpath:
+            vcd = VaspChargeDensity(os.path.join(path, directory, 'CHGCAR'))
+            dens = vcd.chg[-1]
+            dens /= dens.flatten().sum()
+            densities.append(dens)
+
+        name = directory
+        atoms = vcd.atoms[-1]
+
+        #if stride != 1:
+        #    dens = dens[::stride, ::stride, ::stride]
+
+        data_object = a2g.convert(atoms)
+        data_object.charge_density = densities
+        data_object.name = name
+
+        if probe_graph_adder is not None:
+            data_object = probe_graph_adder(data_object)
+
+        txn.put(f"{fid}".encode("ascii"), pickle.dumps(data_object,protocol=-1))
+        txn.commit()
+
     
     txn = db.begin(write = True)
     txn.put(f'length'.encode('ascii'), pickle.dumps(fid + 1, protocol=-1))
     txn.commit()
-    
     
     db.sync()
     db.close()

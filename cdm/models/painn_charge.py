@@ -27,9 +27,12 @@ class PaiNN_Charge(PaiNN):
         kwargs.pop('atomic')
         kwargs.pop('probe')
         
+        if not self.probe:
+            kwargs["num_elements"] = 118
+
         if self.probe:
-            kwargs['num_elements'] = 84
-                 
+            kwargs['num_elements'] = 119
+
         super().__init__(
             num_atoms = 1,
             bond_feat_dim = 1,
@@ -59,7 +62,6 @@ class PaiNN_Charge(PaiNN):
             neighbors,
             edge_dist,
             edge_vector,
-            id_swap,
         ) = self.generate_graph_values(data)
 
         assert z.dim() == 1 and z.dtype == torch.long

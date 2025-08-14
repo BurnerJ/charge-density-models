@@ -13,7 +13,8 @@ from cdm.utils.probe_graph import ProbeGraphAdder
 
 def inference(
     atoms, 
-    model, 
+    model,
+    task_id,
     grid = (100, 100, 100), 
     atom_cutoff = 6, 
     probe_cutoff = 6,
@@ -22,7 +23,7 @@ def inference(
     device='cuda',
     total_density = None,):
 
-    if device is 'cuda' and (torch.cuda.is_available() == False):
+    if device == 'cuda' and (torch.cuda.is_available() == False):
         warnings.warn('Cuda not available: running on CPU. Set device="cpu" to avoid this warning')
         device = 'cpu'
 
@@ -42,6 +43,7 @@ def inference(
         data_object.charge_density[0,0,0] = total_density
     data_object.to(device)
     model.to(device)
+    model.eval()
 
     pga = ProbeGraphAdder(
         num_probes = batch_size,
@@ -81,9 +83,12 @@ def inference(
         batch = data_list_collater([data_object.clone().detach()])
         batch.probe_data = Batch.from_data_list([data_object.probe_data])
 
-        with torch.no_grad():
-            preds = torch.cat((preds, model(batch)))
 
+        with torch.no_grad():
+            preds = torch.cat((preds, model(batch, task_id=task_id)))
+            #new_preds = model(batch, task_id=task_id)
+            #new_preds /= torch.sum(new_preds)
+            #preds = torch.cat((preds, new_preds))
         slice_start += batch_size
         torch.cuda.empty_cache()
         

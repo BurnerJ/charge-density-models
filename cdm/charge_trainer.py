@@ -27,9 +27,9 @@ from ocpmodels.common.data_parallel import (
 from ocpmodels.modules.loss import AtomwiseL2Loss, DDPLoss, L2MAELoss
 from ocpmodels.modules.evaluator import *
 
+import random
 from cdm.utils.probe_graph import ProbeGraphAdder
 from cdm import models
-
 
 @registry.register_trainer("charge")
 class ChargeTrainer(BaseTrainer):
@@ -119,7 +119,10 @@ class ChargeTrainer(BaseTrainer):
         self.name = 'charge'
         self.log_every = log_every
         self.num_devices = self.config['gpus'] if (self.config['gpus'] > 0) else 1
-    
+
+        self.guests = self.config["optim"]["guests"]
+        self.val_guest = self.config["optim"]["val_guest"]
+
     def load_loss(self):
         
         self.loss_fn = {}
@@ -136,6 +139,8 @@ class ChargeTrainer(BaseTrainer):
                 self.loss_fn[loss] = AtomwiseL2Loss()
             elif loss_name == 'normed_mae':
                 self.loss_fn[loss] = NormedMAELoss()
+            elif loss_name == 'tanimoto':
+                self.loss_fn[loss] = custom_loss
             else:
                 raise NotImplementedError(
                     f'Unknown loss function name: {loss_name}'
@@ -189,7 +194,7 @@ class ChargeTrainer(BaseTrainer):
                     subbatch.probe_data = Batch.from_data_list(subbatch.probe_data)
 
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                out = self._forward(batch)
+                out = self._forward(batch, task_id=0)
 
             if self.normalizers is not None and 'target' in self.normalizers:
                 out['charge'] = self.normalizers['target'].denorm(
@@ -248,14 +253,42 @@ class ChargeTrainer(BaseTrainer):
                         subbatch.probe_data = Batch.from_data_list(subbatch.probe_data)
                 
                 # Forward, loss, backward.
-                with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                    out = self._forward(batch)
-                    loss = self._compute_loss(out, batch)
-                loss = self.scaler.scale(loss) if self.scaler else loss
-                
+                #with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+                loss = 0
+                target_copy = batch[0].probe_data.target
+                with torch.cuda.amp.autocast(enabled=False):
+                    # Batch target attribute is list [CH4_1_bar, CH4_65_bar, Xe_1_bar]
+                    #batch[0].task_id = random.choice(list(self.guests.values()))
+                    for task in list(self.guests.values()):
+                        batch[0].probe_data.target = target_copy
+                        batch[0].task_id = task
+                        try:
+                            out = self._forward(batch, task_id=batch[0].task_id)
+                        except torch.cuda.OutOfMemoryError:
+                            print("CUDA memory error, skipping MOF {}".format(batch[0].name))
+                            continue
+                    
+                        #out["charge"] /= torch.sum(out["charge"].flatten())
+
+                        target = batch[0].probe_data.target[batch[0].task_id]
+                    
+                        if target.sum() == 0:
+                            continue
+                        #target /= torch.sum(target.flatten())
+                        batch[0].probe_data.target = target
+                        print("    task_id: {}".format(batch[0].task_id), out["charge"] / out["charge"].sum(), batch[0].probe_data.target / batch[0].probe_data.target.sum())
+                        loss_task = self._compute_loss(out, batch)
+                        loss += loss_task
+                        print("    Loss: {}".format(loss_task))
+
+                print("Total loss: {}".format(loss))
+
+                self.save(checkpoint_file='checkpoint.pt', training_state=True)
+
                 if torch.sum(out['charge']) != 0:
                     if not torch.any(torch.isinf(out['charge'])):
-                        self._backward(loss)
+                        if not torch.any(torch.isnan(out["charge"])):
+                            self._backward(loss)
                 
                 scale = self.scaler.get_scale() if self.scaler else 1.0
 
@@ -297,10 +330,12 @@ class ChargeTrainer(BaseTrainer):
 
                 # Evaluate on val set after every `eval_every` iterations.
                 if self.step % eval_every == 0:
+                    # Free CUDA memory
                     self.save(
                         checkpoint_file='checkpoint.pt', training_state=True
                     )
-
+                    #TODO Fix Val loader
+                    
                     if self.val_loader is not None:
                         val_metrics = self.validate(
                             split='val',
@@ -334,7 +369,7 @@ class ChargeTrainer(BaseTrainer):
                                 self.metrics,
                                 val_metrics,
                             )
-
+                    
                 if self.scheduler.scheduler_type == 'ReduceLROnPlateau':
                     if self.step % eval_every == 0:
                         self.scheduler.step(
@@ -351,8 +386,8 @@ class ChargeTrainer(BaseTrainer):
         if self.config.get('test_dataset', False):
             self.test_dataset.close_db()
 
-    def _forward(self, batch_list):
-        output = self.model(batch_list)
+    def _forward(self, batch_list, task_id):
+        output = self.model(batch_list, task_id=task_id)
 
         if output.shape[-1] == 1:
             output = output.view(-1)
@@ -456,9 +491,15 @@ class ChargeTrainer(BaseTrainer):
                     subbatch.probe_data = Batch.from_data_list(subbatch.probe_data)
 
             # Forward.
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                out = self._forward(batch)
-            loss = self._compute_loss(out, batch)
+            with torch.cuda.amp.autocast(enabled=False):
+                task_id = self.guests[self.val_guest]
+                out = self._forward(batch, task_id=task_id)
+                #out["charge"] /= torch.sum(out["charge"].flatten())
+                tens = batch[0].probe_data.target
+                #target = (batch[0].probe_data.target[0] / batch[0].probe_data.target[0].sum()).to(self.device)
+                target = (batch[0].probe_data.target[task_id]).to(self.device)
+                batch[0].probe_data.target = target
+                loss = self._compute_loss(out, batch)
 
             # Compute metrics.
             metrics = self._compute_metrics(out, batch, evaluator, metrics)
@@ -579,7 +620,7 @@ class ChargeTrainer(BaseTrainer):
                 dataset,
                 collate_fn=self.parallel_collater,
                 num_workers=self.config["optim"]["num_workers"],
-                pin_memory=True,
+                pin_memory=False,
                 batch_sampler=sampler,
                 prefetch_factor = 6,
             )
@@ -597,10 +638,11 @@ class ChargeEvaluator(Evaluator):
             'charge_mse',
             'true_density',
             'total_charge_ratio',
+            'tanimoto'
         ]
         
         self.task_attributes['charge'] = ['charge']
-        self.task_primary_metric['charge'] = 'norm_charge_mae'
+        self.task_primary_metric['charge'] = 'tanimoto'
         
         self.metric_fn = self.task_metrics[task]
         
@@ -628,6 +670,61 @@ class NormedMAELoss(torch.nn.Module):
     ):
         return torch.sum(torch.abs(prediction - target)) \
              / torch.sum(torch.abs(target))
+
+def custom_loss(data_1, data_2, **kw):
+    
+    #return (torch.sum(data_2,data_1)).mean()
+
+    #data_1 += 1
+    #data_2 += 1
+    #mse = (torch.subtract(data_1, data_2) ** 2).sum() / (data_2 ** 2).sum()
+    #data_1 = torch.abs(data_1)
+    #data_2 = torch.abs(data_2)
+    #loss= - ((data_1 * data_2).sum() /
+    #                          ((data_1 * data_1).sum() +
+    #                           (data_2 * data_2).sum() -
+    #                           (data_1 * data_2).sum()))
+    
+    #from torch.nn import KLDivLoss as KLD
+    #from torch.nn import functional as F
+    #kl_loss_fn = KLD(reduction="batchmean", log_target=True)
+    #preds = torch.clamp(data_1, min=1e-20)
+    #preds /= preds.sum()
+    #target = torch.clamp(data_2, min=1e-20)
+    #target /= target.sum()
+    #kl_loss = kl_loss_fn(torch.log(preds),
+    #                     torch.log(target))
+
+    data_1 /= data_1.sum()
+    data_2 /= data_2.sum()
+
+    tanimoto = - ((data_1 * data_2).sum() /
+                              ((data_1 * data_1).sum() +
+                               (data_2 * data_2).sum() -
+                               (data_1 * data_2).sum()))
+
+    #pred = pred.view(-1, 1)
+    #target = target.view(-1, 1)
+    #pred = torchsort.soft_rank(pred, **kw)
+    #target = torchsort.soft_rank(target, **kw)
+    #pred = pred - pred.mean()
+    #pred = pred / pred.norm()
+    #target = target - target.mean()
+    #target = target / target.norm()
+    #return (pred * target).sum()
+
+    #return torch.sum(torch.where(a != 0, a * np.log(a / b), 0))
+    #where_0 = torch.where(data_2 == 0)
+    #data_2[where_0] = 1E-25
+    #where_0 = torch.where(data_1 == 0)
+    #data_1[where_0] = 1E-25
+    #loss_pointwise = data_2 * (data_2.log() - data_1)
+    #print(loss_pointwise)
+    #loss = loss_pointwise.mean()
+    #mse_loss = torch.sum(torch.square(data_2 - data_1))
+    return tanimoto
+    
+
     
 def absolute_error(prediction, target):
     error = torch.abs(prediction - target)
@@ -683,4 +780,21 @@ def norm_charge_rmse(prediction, target):
         'metric': error.item(),
         'total':  error.item(),
         'numel':  1,
+    }
+
+def tanimoto(prediction, target):
+    data_1 = prediction["charge"]
+    data_2 = target["charge"]
+
+    data_1 /= data_1.sum()
+    data_2 /= data_2.sum()
+
+    error = - ((data_1 * data_2).sum() /
+                              ((data_1 * data_1).sum() +
+                               (data_2 * data_2).sum() -
+                               (data_1 * data_2).sum()))
+    return {
+            'metric': error.item(),
+            'total': error.item(),
+            'numel': 1,
     }
